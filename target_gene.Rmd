@@ -1,0 +1,518 @@
+---
+title: "Target-Genes"
+output: html_document
+date: '2024-12-24'
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(tidyverse)
+source('utils_eggnog.R')
+#load("results.RData")
+#load("250630_results.RData")
+```
+
+# grep target genes
+
+```{r}
+respiration <- 'atpA|nuoF|sdhA|coxA|ccoN|cyoA|cydA'
+sulfur <- 'asrA|fcc|sqR|dsrA|soR|soxB'
+nitrogen <- 'amoA|hzsA|nifH|narG|napA|nirS|nirK|nrfA|nosZ|nxrA|norB'
+iron <- 'cyc2|mtrB||omcB'
+methane <- 'mcrA|mmoA|pmoA'
+hydrogen <- 'large subunit of NiFe-, FeFe-, and Fe-hydrogenases'
+carbon <- 'rbcL|acsB|aclB|mcR|hbsT|hbsC'
+```
+
+## test run
+```{r}
+test_large <- read_tsv('./eggnog/13_5B_1.emapper.annotations', col_names = names(test))
+
+test_process <- test_large %>% 
+  mutate(
+    # this is to get corresponding entry for max annot level  
+    # new_col = str_extract(eggNOG_OGs, 
+    #                       paste0("[^@,]+(?=@", 
+    #                              str_extract(max_annot_lvl, "^\\d+"), "\\|", 
+    #                              str_extract(max_annot_lvl, "\\|.+"), ")")))
+    # this is to get corresponding COG for bacteria
+    #COG = str_extract(eggNOG_OGs, "COG\\d+(?=@2\\|Bacteria)")) %>% 
+    COG = str_extract(eggNOG_OGs, "(?<=,)[^@,]+(?=@2\\|Bacteria)")) %>% 
+  dplyr::select(eggNOG_OGs, COG, COG_category, Description, Preferred_name, KEGG_ko)
+
+
+test_process %>% 
+  left_join(bacteria_og_annot, by = c('COG', 'COG_category')) %>% View()
+
+
+test_process %>% count(COG) %>% View()
+test_process %>% count(COG_category)
+
+
+```
+
+## Load data
+```{r}
+metadata <- readxl::read_xlsx('Metadata.xlsx', sheet = 'LOI')
+cog_list_path <- './eggnog/'
+cog_list <- list.files(cog_list_path)
+
+# use smallest file to get header
+test <- read_tsv('eggnog/11_4C.emapper.annotations', skip = 4)
+
+# bacteria OG annotations
+bacteria_og_annot <- read_tsv('./bacteria_e5.og_annotations.tsv',
+                              col_names = c('COG', 'COG_category', 'COG_description'))
+
+
+cog_combined_profiles <- purrr::reduce(cog_list, merge2_cog)
+gene_combined_profiles <- purrr::reduce(cog_list, merge2_gene)
+
+cog_combined_profiles <- cog_combined_profiles[-which(is.na(cog_combined_profiles$COG)), ]
+cog_combined_profiles_noec <- cog_combined_profiles %>% 
+  select(-`03_5A`, -`06_4A`, -`11_4C`)
+
+gene_combined_profiles <- gene_combined_profiles[-which(is.na(gene_combined_profiles$COG)), ]
+gene_combined_profiles_noec <- gene_combined_profiles %>% 
+  select(-`03_5A`, -`06_4A`, -`11_4C`)
+
+cog_profiles <- gene_combined_profiles_noec
+```
+
+## 1. Top relative abundance
+```{r}
+
+# replace NA with 0
+cog_combined_profiles_clean <- cog_profiles %>% 
+  replace(is.na(.), 0) %>% 
+  tibble::column_to_rownames('COG')
+
+
+
+# normalize to 100%
+cog_combined_profiles_norm <- data.frame(apply(cog_combined_profiles_clean, 2,
+                                               function(x) x/sum(x) * 100))
+
+## impute NAs and set low abundance taxon to 0
+cog_combined_profiles_norm[is.na(cog_combined_profiles_norm) | cog_combined_profiles_norm < 0.05] <- 0 
+
+## remove taxa with 0s in all samples
+cog_combined_profiles_norm <- cog_combined_profiles_norm[rowSums(cog_combined_profiles_norm) != 0, ] 
+
+## renormalize to 100%
+cog_combined_profiles_renorm <- data.frame(apply(cog_combined_profiles_norm, 2,
+                                                 function(x) x/sum(x)) * 100)
+
+
+n_features <- 20
+cog_top_features <- top_features(cog_combined_profiles_renorm) %>% 
+  left_join(bacteria_og_annot %>% 
+              rename(rowname = 'COG'), by = 'rowname') %>% 
+  mutate(variable = str_remove(variable, 'X'))
+cog_top_features_others <- top_features_other(cog_combined_profiles_renorm) %>% 
+  mutate(rowname = fct_relevel(rowname, 'Other', after = 0))
+
+# plot stacked bar chart
+plot_overview(cog_top_features)
+plot_overview_stratified(cog_top_features)
+
+# using gene - carB & tuf are different than when just using COG
+```
+
+## 2. DA COG - using Wilcoxon's test
+```{r}
+# use relabund
+cog_combined_profiles_to_test <- cog_combined_profiles_renorm
+colnames(cog_combined_profiles_to_test) <- gsub("^X", "", colnames(cog_combined_profiles_to_test))
+a_vs_b <- run_wilcox(cog_combined_profiles_to_test, 'A - Inside', 'B - Just by')
+a_vs_c <- run_wilcox(cog_combined_profiles_to_test, 'A - Inside', 'C - Control')
+b_vs_c <- run_wilcox(cog_combined_profiles_to_test, 'B - Just by', 'C - Control')
+
+Depth <-colSums(cog_combined_profiles_clean)
+
+# use log2(cpm + 1)
+cog_combined_profiles_cpm <- cog_combined_profiles_clean %>% 
+  tibble::rownames_to_column('COG') %>% 
+  pivot_longer(-COG) %>% 
+  dplyr::rename(SampleID = 'name') %>% 
+  # divide by seqdepth
+  left_join(metadata, by = 'SampleID') %>% 
+  mutate(value = log2(value/Depth * (10^6) + 1)) %>% 
+  dplyr::select(COG, SampleID, value) %>% 
+  pivot_wider(names_from = 'SampleID', values_from = 'value') %>% 
+  tibble::column_to_rownames('COG')
+
+# filter low abundance/rare COG
+cog_combined_profiles_cpm_filt <- cog_combined_profiles_cpm %>% 
+  filter(row.names(.) %in% rownames(cog_combined_profiles_renorm))
+cog_combined_profiles_to_test <- cog_combined_profiles_cpm_filt
+
+a_vs_b <- run_wilcox(cog_combined_profiles_to_test, 'A - Inside', 'B - Just by')
+a_vs_c <- run_wilcox(cog_combined_profiles_to_test, 'A - Inside', 'C - Control')
+b_vs_c <- run_wilcox(cog_combined_profiles_to_test, 'B - Just by', 'C - Control')
+
+```
+
+## 3. targeted genes
+```{r}
+respiration <-  c('atpA', 'nuoF', 'sdhA', 'coxA', 'ccoN', 'cyoA', 'cydA')
+sulfur <- c('ttrB', 'soxA', 'soxB', 'soxF', 'dsrA', 'dsrB', 'aprA', 'aprB', 'sat', 'qmoA', 'asrA', 'asrB', 'fccB', 'psrA', 'dmdA', 'mddA', 'dmsC', 'sqr', 'tauD', 'hdrA', 'fcc', 'sqR', 'dsrA', 'soR', 'soxB')
+nitrogen <- c('nifH', 'ureC', 'amoA', 'hao', 'nxrA',  'narG', 'napA', 'nirS', 'nirK', 'norB',  'nosZ', 'nrfA','nirB', 'nirD', 'hzsA')
+iron <- c('coxA', 'coxB', 'mtrA', 'mtrB', 'cydA', 'omcB', 'ccoN', 'petC')
+methane <- c('mcrA', 'mxaf', 'pmoA', 'mtsA', 'mtbA', 'mttB2', 'mtbC', 'mtrA')
+hydrogen <- c('hydB') #, FeFe-, and Fe-hydrogenases'
+carbon <- c('rbcL', 'acsB', 'aclB', 'mcR', 'hbsT', 'hbsC')
+
+# boxplot for each category
+cog_combined_profiles_cpm %>% 
+  filter(row.names(.) %in% carbon) %>% 
+  tibble::rownames_to_column('COG') %>% 
+  pivot_longer(-COG, names_to = 'SampleID') %>% 
+  left_join(metadata, by = 'SampleID') %>% 
+  #filter(Side %in% c('A_Inside', 'B_Justby')) %>% 
+  ggplot(aes(x = Side, y = value, col = Side)) + 
+  geom_boxplot() + 
+  geom_jitter(position = position_jitterdodge()) + 
+  #ggpubr::stat_compare_means(method = 'wilcox') +
+  facet_wrap(~COG, scales = 'free') + 
+  theme_bw() + 
+  theme(text = element_text(size = 10), axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5)) +
+  labs(title = "Carbon cycling genes")
+ggsave("gene_carbon_boxplot.jpg", width = 29, height = 21, units = "cm", dpi = "retina")
+
+# heatmap for all category
+cog_combined_profiles_cpm %>% 
+  tibble::rownames_to_column('COG') %>%
+  pivot_longer(-COG, names_to = 'SampleID') %>% 
+  left_join(metadata, by = 'SampleID') %>%
+  mutate(Group = case_when(COG %in% respiration ~ 'Respiration',
+                           COG %in% sulfur ~ 'Sulfur Cycling',
+                           COG %in% nitrogen ~ 'Nitrogen Cycling',
+                           COG %in% iron ~ 'Iron Cycling',
+                           COG %in% methane ~ 'Methane Cycling',
+                           #COG %in% hydrogen ~ 'Hydrogen )
+                           COG %in% carbon ~ 'Carbon Fixation',
+                           TRUE ~ 'Others')) %>% 
+  filter(Group != 'Others') %>% 
+  ggplot(aes(x = SampleID, y = COG, fill = value)) + 
+  geom_tile(col = 'white') + 
+  geom_text(aes(label = round(value, 2)),
+            size = 2.5, color = 'black') + 
+  #scale_fill_viridis_b() +
+  scale_fill_gradientn(colours = c("white", "green1", "#E31A1C"), values = c(0,0.1,1)) +
+  facet_grid(cols = vars(Side),
+             rows = vars(Group),
+             scales = 'free', space = 'free') + 
+  labs(y = 'Gene', fill = 'log2(CPM + 1)', x = '') +
+  theme_bw() + 
+  theme(text = element_text(size = 15),
+        strip.text.y.right = element_text(angle = 0),
+        strip.background = element_rect(fill = 'white'),
+        #axis.text.x = element_blank(),
+        legend.title = element_text(size = 15),
+        legend.text = element_text(size = 10),
+        axis.text.x = element_text(angle = 45, vjust = 0.5, hjust=0.5))
+ggsave("gene_heatmap.jpg", width = 29, height = 21, units = "cm", dpi = "retina")
+```
+
+
+## 3. DE COG - using DESeq2
+```{r}
+library(DESeq2)
+metadata_deseq2 <- metadata %>% 
+  dplyr::select(SampleID, Side, Mooring) %>% 
+  tibble::column_to_rownames('SampleID')
+metadata_deseq2 <- metadata_deseq2[-7, ]
+dds <- DESeqDataSetFromMatrix(countData = cog_combined_profiles %>% 
+                                replace(is.na(.), 0) %>% 
+                                tibble::column_to_rownames('COG'),
+                              colData = metadata_deseq2,
+                              design = ~Side)
+
+# filter rowcount
+mat <- counts(dds)
+keep <- rowSums(mat >= 10) >=  3
+dds <- dds[keep, ]
+
+# estimate size factor using poscount to account for zero inflation
+dds <- estimateSizeFactors(dds, type = 'poscount')
+
+# plot vsd variance stabilised transformation
+vsd <- vst(dds, blind = T)
+vsd_mat <- assay(vsd)
+pcaData <- plotPCA(vsd, intgroup = c('Side', 'Mooring'), returnDat = T)
+
+pcaData$Mooring <- as.character(pcaData$Mooring)
+
+percentVar <- round(100 * attr(pcaData, "percentVar"))
+p <- ggplot(pcaData, aes(x = PC1, y=PC2, color=Side, shape = Mooring)) +
+  geom_point(size=3) +
+  xlab(paste0("PC1: ",percentVar[1],"% variance")) +
+  ylab(paste0("PC2: ",percentVar[2],"% variance")) + 
+  coord_fixed() + theme_bw()
+p
+```
+
+
+```{r}
+# run de
+dds <- DESeq(dds)
+resultsNames(dds)
+res <- results(dds)
+
+# https://www.biostars.org/p/9468802/ for comparisons not in the resultsNames
+resLFC_a_vs_c <- results(dds, contrast = list(c('Side_C...Control_vs_A...Inside')))
+resLFC_b_vs_c <- results(dds, contrast = list(c('Side_C...Control_vs_A...Inside',
+                                                'Side_B...Just.by_vs_A...Inside')))
+#resLFC_a_vs_b <- results(dds, contrast = c('Side', 'A_Inside', 'B_Justby'))
+
+
+resLFC_a_vs_c_shrink <- lfcShrink(dds, type = 'ashr', res=resLFC_a_vs_c)
+resLFC_b_vs_c_shrink <- lfcShrink(dds, type = 'ashr', res=resLFC_b_vs_c)
+#resLFC_a_vs_b_shrink <- lfcShrink(dds, type = 'ashr', res=resLFC_a_vs_b)
+
+#get_de_res(resLFC_a_vs_b, 0.1)
+get_de_res(resLFC_a_vs_c, 0.1)
+get_de_res(resLFC_b_vs_c, 0.1)
+
+# plot volcano
+#plot_volcano(resLFC_a_vs_b, 0.05, 'A-Inside vs B-Justby')
+plot_volcano(resLFC_a_vs_c, 0.05, 'A-Inside vs C-Control')
+plot_volcano(resLFC_b_vs_c, 0.05, 'B-Justby vs C-Control')
+
+```
+
+## get kegg annotation
+```{r}
+kegg_cog <- read_delim('./bacteria_eggnog_to_KEGG_term2gene.tsv', delim = " ")
+kegg_annot <- read_delim('./KEGG_term2name.tsv', delim = " ")
+
+kegg_cog_annot <- kegg_cog %>% 
+  left_join(kegg_annot, by = 'from') %>% 
+  na.omit() %>% 
+  dplyr::rename(COG = 'to.x', 
+         Annotation = 'to.y')
+
+get_de_res(resLFC_a_vs_c, 0.05) %>% 
+  left_join(kegg_cog_annot, by = 'COG') %>% 
+  unique() %>% View()
+
+#which(rownames(resLFC_a_vs_c) %in% kegg_cog$to)
+
+# GSEA
+kegg_a_vs_c <- GSEA_from_DESeq(genelist = resLFC_a_vs_c$log2FoldChange,
+                               gene_names = rownames(resLFC_a_vs_c),
+                               term2gene = kegg_cog %>% 
+                                 dplyr::rename(KEGG = 'from', gene = 'to'),
+                               term2name = kegg_annot)
+kegg_b_vs_c <- GSEA_from_DESeq(genelist = resLFC_b_vs_c$log2FoldChange,
+                               gene_names = rownames(resLFC_b_vs_c),
+                               term2gene = kegg_cog %>% 
+                                 dplyr::rename(KEGG = 'from', gene = 'to'),
+                               term2name = kegg_annot)
+make_NES_barplot(kegg_a_vs_c@result, 'A-Inside vs C-Control')
+make_NES_barplot(kegg_b_vs_c@result, 'B-Just by vs C-Control')
+```
+
+
+```{r}
+combined_kegg <- rbind(kegg_a_vs_c@result %>% 
+                         mutate(comparison = 'A (inside) <——> C (control)'),
+                       kegg_b_vs_c@result %>% 
+                         mutate(comparison = 'B (just by) <——> C (control)') %>% 
+  mutate(comparison = factor(comparison, levels = c('A (inside) <——> C (control)', 'B (just by) <——> C (control)'))))
+
+make_NES_barplot_combined(combined_kegg)
+
+
+ggsave("whole_metabolisms.jpg", width = 17.5, height = 25, units = "cm", dpi = "retina")
+
+```
+
+## get GO annotation
+```{r}
+go_cog <- read_tsv('../data/eggnog_with_GO_all_term2gene.txt', 
+                   col_names = c('COG', 'GO'))
+go_annot <- read_tsv('../data/goslim_metagenome.txt', 
+                     col_names = c('GO', 'Annotation'))
+go_cog_annot <- go_cog %>% 
+  left_join(go_annot, by = 'GO')
+
+go_all_annot <- read_tsv('../data/all_GO_annotations.tsv')
+GO_MF_term2name <- go_all_annot %>% 
+  dplyr::filter(ontology=="MF") %>% 
+  dplyr::select(GO_ID, GO_desc) %>%
+  dplyr::rename(from=GO_ID, to=GO_desc)
+
+go_a_vs_dist <- GSEA_from_DESeq(genelist = resLFC_a_vs_dist$log2FoldChange,
+                                gene_names = rownames(resLFC_a_vs_dist),
+                                term2gene = go_cog %>%  
+                                  rename(gene = 'COG') %>% 
+                                  dplyr::select(GO, gene),
+                                term2name = go_all_annot %>% 
+                                  dplyr::select(GO_ID, GO_desc) %>% 
+                                  rename(GO = 'GO_ID', Annotation = 'GO_desc'))
+
+go_b_vs_dist <- GSEA_from_DESeq(genelist = resLFC_b_vs_dist$log2FoldChange,
+                                gene_names = rownames(resLFC_b_vs_dist),
+                                term2gene = go_cog %>% 
+                                  rename(gene = 'COG') %>% 
+                                  dplyr::select(GO, gene),
+                                term2name = go_all_annot %>% 
+                                  dplyr::select(GO_ID, GO_desc) %>% 
+                                  rename(GO = 'GO_ID', Annotation = 'GO_desc'))
+
+go_c_vs_dist <- GSEA_from_DESeq(genelist = resLFC_c_vs_dist$log2FoldChange,
+                                gene_names = rownames(resLFC_c_vs_dist),
+                                term2gene = go_cog %>% 
+                                  rename(gene = 'COG') %>% 
+                                  dplyr::select(GO, gene),
+                                term2name = go_all_annot %>% 
+                                  dplyr::select(GO_ID, GO_desc) %>% 
+                                  rename(GO = 'GO_ID', Annotation = 'GO_desc'))
+
+go_a_vs_b <- GSEA_from_DESeq(genelist = resLFC_a_vs_b$log2FoldChange,
+                             gene_names = rownames(resLFC_a_vs_b),
+                             term2gene = go_cog %>% 
+                               rename(gene = 'COG') %>% 
+                               dplyr::select(GO, gene),
+                             term2name = go_all_annot %>% 
+                               dplyr::select(GO_ID, GO_desc) %>% 
+                               rename(GO = 'GO_ID', Annotation = 'GO_desc'))
+
+go_a_vs_c <- GSEA_from_DESeq(genelist = resLFC_a_vs_c$log2FoldChange,
+                             gene_names = rownames(resLFC_a_vs_c),
+                             term2gene = go_cog %>% 
+                               rename(gene = 'COG') %>% 
+                               dplyr::select(GO, gene),
+                             term2name = go_all_annot %>% 
+                               dplyr::select(GO_ID, GO_desc) %>% 
+                               rename(GO = 'GO_ID', Annotation = 'GO_desc'))
+go_b_vs_c <- GSEA_from_DESeq(genelist = resLFC_b_vs_c$log2FoldChange,
+                             gene_names = rownames(resLFC_b_vs_c),
+                             term2gene = go_cog %>% 
+                               rename(gene = 'COG') %>% 
+                               dplyr::select(GO, gene),
+                             term2name = go_all_annot %>% 
+                               dplyr::select(GO_ID, GO_desc) %>% 
+                               rename(GO = 'GO_ID', Annotation = 'GO_desc'))
+
+make_NES_barplot(go_b_vs_dist@result, 'A-Inside vs B-Justby')
+
+```
+
+# NMDS
+
+```{r}
+metadata2 <- data.frame(readxl::read_excel("../../Actual 16s/Metadata.xlsx", sheet = "LOI"), stringsAsFactors = FALSE, row.names = NULL)
+metadata_all <- metadata %>% 
+  left_join(metadata2 %>% select(Actual.Sample.Name,Aluminium, Iron, Calcium, Magnesium, Silicon, LOI450), by = c("Actual Sample Name" = "Actual.Sample.Name"))
+metadata_num <- metadata_all  %>% 
+  dplyr::select_if(is.numeric)
+
+```
+
+## on gene profiles
+```{r}
+gene_combined_profiles_zero <- gene_combined_profiles
+gene_combined_profiles_zero[is.na(gene_combined_profiles_zero)] <- 0
+```
+
+## on KEGG mapping
+```{r}
+keggmap_combined_profiles <- cog_combined_profiles %>% 
+  pivot_longer(-COG) %>% 
+  right_join(kegg_cog_annot) %>% 
+  drop_na(name) %>% 
+  drop_na(value)
+
+keggmap_combined_profiles <- keggmap_combined_profiles %>% 
+  group_by(name, from) %>% 
+  summarize(sum_value = sum(value))
+
+keggmap_combined_profiles <- keggmap_combined_profiles %>% 
+  pivot_wider(names_from = name, values_from = sum_value)
+keggmap_combined_profiles[is.na(keggmap_combined_profiles)] <- 0
+
+#make samples in different rows, and species in the different columns
+keggmap_combined_profiles <- keggmap_combined_profiles %>% 
+  column_to_rownames("from") %>% 
+  t()
+
+
+library(vegan)
+brack_relabund <- decostand(keggmap_combined_profiles, method = "total")
+#brack_relabund <- keggmap_combined_profiles
+```
+
+```{r}
+set.seed(42)
+brack_bray <- vegdist(brack_relabund, method = "bray")
+brack_nmds <- metaMDS(brack_bray,
+                      distance = "bray",
+                      try = 99,
+                      maxit = 999, 
+                      trymax = 999)
+
+brack_nmds
+
+# fix table
+data.scores <- as.data.frame(scores(brack_nmds))  #Using the scores function from vegan to extract the site scores and convert to a data.frame
+data.scores$side <- metadata$Side  # create a column of site names, from the rownames of data.scores
+data.scores$mooring <- metadata$Mooring  #  add location
+head(data.scores)  #look at the data
+
+ggplot(data.scores) +
+  geom_point(aes(x=NMDS1,y=NMDS2,shape=mooring,colour=side),size=3) + # add the point markers
+  geom_text(label = "Stress = 0.0553", x = -0.15, y = 0.01) +
+  scale_color_manual(values = c("#5A5156", "#F6222E", "#16FF32", "#FE00FA")) +
+  labs(title = "NMDS on KEGG pathway mapping gene set")
+```
+
+```{r}
+ts_envfit <- envfit(brack_nmds, metadata_num, permutations = 999, na.rm = TRUE) 
+ts_envfit_scores <- scores(ts_envfit, "vectors")[ts_envfit$vectors$pvals<0.05, ] # only plot arrows 
+ts_envfit_scores
+```
+
+
+## on genes
+```{r}
+gene_combined_profiles_zero <- gene_combined_profiles_zero %>% 
+  column_to_rownames("COG")
+gene_combined_profiles_keep <- gene_combined_profiles_zero[rowSums(gene_combined_profiles_zero) > 10, ] %>% 
+  t()
+
+brack_relabund <- decostand(gene_combined_profiles_keep, method = "total")
+
+set.seed(42)
+brack_bray <- vegdist(brack_relabund, method = "bray")
+brack_nmds <- metaMDS(brack_bray,
+                      distance = "bray",
+                      try = 99,
+                      maxit = 999, 
+                      trymax = 999)
+
+brack_nmds
+
+# fix table
+data.scores <- as.data.frame(scores(brack_nmds))  #Using the scores function from vegan to extract the site scores and convert to a data.frame
+data.scores$side <- metadata$Side  # create a column of site names, from the rownames of data.scores
+data.scores$mooring <- metadata$Mooring  #  add location
+head(data.scores)  #look at the data
+
+ggplot(data.scores) +
+  geom_point(aes(x=NMDS1,y=NMDS2,shape=mooring,colour=side),size=3) + # add the point markers
+  #geom_text(label = "Stress = 0.03366", x = -0.13, y = 0.05) +
+  scale_color_manual(values = c("#5A5156", "#F6222E", "#16FF32", "#FE00FA")) +
+  labs(title = "NMDS on genes")
+
+```
+
+```{r}
+ts_envfit <- envfit(brack_nmds, metadata_num, permutations = 999, na.rm = TRUE) 
+ts_envfit_scores <- scores(ts_envfit, "vectors")[ts_envfit$vectors$pvals<0.05, ] # only plot arrows 
+```
+
+

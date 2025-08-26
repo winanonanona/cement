@@ -1,0 +1,206 @@
+---
+title: "R Notebook"
+output: html_notebook
+---
+
+```{r}
+library(tidyverse)
+library(pals)
+library(vegan)
+```
+
+
+```{r}
+bracken.files <- list.files("kraken/")
+
+for (i in 1:length(bracken.files)){
+  brack <- read.delim(paste0("kraken/", bracken.files[i]), header = F)
+  brack1 <- brack %>% 
+    select(V2, V4, V6) %>% 
+    filter(V4=="S") %>% 
+    filter(V2>0) %>% 
+    filter(!grepl("Homo sapiens", V6)) %>% 
+    #filter(V2 > (0.005*sum(V2))) %>%  #0.002385 for NMDS, 0.005 for kraken bar plot
+    mutate(sample = strsplit(bracken.files[i], "_")[[1]][1])
+  if (i==1){
+    brack_appended <- brack1
+  }else{
+    brack_appended <- rbind(brack_appended, brack1)
+  }
+  
+}
+
+
+
+
+
+brack_appended$V6<-str_squish(brack_appended$V6) #5812612 #21089601
+names(brack_appended) <- c("Abundance", "Level", "Taxa", "sample")
+brack_appended_cleaner <- brack_appended %>% 
+  filter(!(sample %in% c("03", "06", "07", "11")))
+length(unique(brack_appended_cleaner$Taxa))
+
+brack_count <- brack_appended_cleaner %>% 
+  group_by(Taxa) %>% 
+  summarise(sum(Abundance)) %>% 
+  arrange(desc(`sum(Abundance)`))
+
+brack_appended_filt <- brack_appended_cleaner %>% 
+  filter(Taxa %in% brack_count$Taxa[1:1000]) #100 genus, 1000 for species
+
+#brack_appended_filt <- brack_appended_cleaner
+```
+
+
+```{r}
+details <- readxl::read_excel("Metadata.xlsx", sheet = "LOI")
+brack_appended_filt[,"sample"] <- as.numeric(brack_appended_filt[,"sample"])
+brack_details <- brack_appended_filt %>% 
+  left_join(details, by = c("sample" = "Samples"))
+
+brack_details[,"sample"] <- as.character(brack_details[,"sample"])
+
+#names(brack_details)[6] <- "Sample name"
+```
+
+# bar plot
+```{r}
+ggplot(brack_details, mapping = aes(x = `sample`, y = Abundance, fill = Taxa)) +
+  geom_bar(stat = "identity", position = "fill") +
+  guides(shape = guide_legend(override.aes = list(size = 0.1)),
+         color = guide_legend(override.aes = list(size = 0.1)),
+         fill = guide_legend(ncol = 1)) +
+  theme(legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7)) + #,
+  #axis.text.x = element_text(angle = 45, vjust = 1, hjust=1)) +
+  scale_fill_manual(values=unname(polychrome())) +
+  facet_wrap(.~Side, nrow = 1, scales = "free")
+
+ggsave("brack_A4_G.jpg", width = 27, height = 23, units = "cm")
+```
+
+#nmds
+```{r}
+# make long table to wide
+brack_wide <- brack_details %>% 
+  filter(!(SampleID %in% c("03_5A", "06_4A","11_4C"))) %>%  
+  select(Abundance,Taxa,`Actual Sample Name`) %>% 
+  reshape(idvar = "Actual Sample Name", direction = "wide", timevar = "Taxa")
+
+# tidy the table
+rownames(brack_wide) <- NULL
+brack_wide <- brack_wide %>% 
+  column_to_rownames("Actual Sample Name")
+brack_wide[is.na(brack_wide)] <- 0
+
+brack_count <- which(colSums(brack_wide < 10) > 5)
+
+
+if(length(brack_count)>0){
+  brack_wide_filt <- brack_wide[, -brack_count]
+}else{
+  brack_wide_filt <- brack_wide
+}
+
+
+#make relative abundances
+brack_relabund <- decostand(brack_wide_filt, method = "total")
+
+```
+
+```{r}
+set.seed(42)
+brack_bray <- vegdist(brack_relabund, method = "bray")
+brack_nmds <- metaMDS(brack_bray,
+                      distance = "bray",
+                      try = 99,
+                      maxit = 99, 
+                      trymax = 99)
+
+brack_nmds$stress
+```
+
+```{r}
+data.scores <- as.data.frame(scores(brack_nmds))  #Using the scores function from vegan to extract the site scores and convert to a data.frame
+data.scores$site <- rownames(data.scores)  # create a column of site names, from the rownames of data.scores
+data.scores$Side <- details$Side[-c(3, 6, 7, 11)]  #  add side
+data.scores$Mooring <- as.character(details$Mooring[-c(3, 6, 7, 11)]) #add mooring
+head(data.scores)  #look at the data
+
+data.scores_poly <- data.scores[c(1, 3, 4, 5, 8, 11, 7, 6, 9), ]
+```
+
+```{r}
+ggplot(data.scores) +
+  #geom_point(aes(x=NMDS1,y=NMDS2), colour = "black", size=4) + # add black outline
+  geom_point(aes(x=NMDS1,y=NMDS2,colour=Side, shape = Mooring),size=3) + # add the point markers
+  geom_text(label = "Stress = 0.1246653", x = -1, y = 1.25) +
+  #stat_ellipse(aes(x=NMDS1,y=NMDS2, colour = Side)) +
+  scale_color_manual(values = c("#F6222E", "#B00068", "#66B0FF")) +
+  geom_polygon(aes(x = NMDS1, y = NMDS2, colour = Side, fill = Side), alpha = 0.1, lty = "blank", data = data.scores_poly, inherit.aes = F) +
+  scale_fill_manual(values = c("#F6222E", "#B00068", "#66B0FF")) +
+  theme_bw()
+
+ggsave("brack_nmds_A4_species.jpg", width = 27, height = 21, units = "cm")
+
+```
+
+```{r}
+require(DESeq2)
+details_fordeseq <- details[-c(3, 6, 7, 11), ]
+details_fordeseq <- details_fordeseq %>% 
+  dplyr::filter(Side %in% c("B - Just by", "C - Control"))
+details_fordeseq$Group <- factor(details_fordeseq$Group, c("Control", "Cement"))
+
+rownames(details_fordeseq) <- NULL
+details_fordeseq <- details_fordeseq %>% 
+  column_to_rownames(var = "Actual Sample Name")
+
+
+brack_wide_fordeseq <- as.matrix(t(brack_wide_filt))
+brack_wide_fordeseq <- brack_wide_fordeseq[,c(rownames(details_fordeseq))]
+
+head(brack_wide_fordeseq)
+head(details_fordeseq)
+
+all(rownames(details_fordeseq) == colnames(brack_wide_fordeseq)) #must be true!
+```
+
+```{r}
+dds <- DESeqDataSetFromMatrix(countData = brack_wide_fordeseq,
+                              colData = details_fordeseq,
+                              design = ~ Group)
+
+dds
+
+dds <- DESeq(dds)
+res <- results(dds)
+res
+
+resLFC <- lfcShrink(dds, coef="Group_Cement_vs_Control", type = "ashr")
+resLFC
+
+resLFC_ordered <- resLFC[order(resLFC$padj),]
+summary(resLFC)
+
+sum(resLFC$padj < 0.1, na.rm=TRUE)
+```
+
+## plot deseq
+```{r}
+reslfc.df <- as.data.frame(resLFC) %>% 
+  dplyr::filter(padj < 0.1) %>% 
+  rownames_to_column("Species") %>% 
+  separate(Species, sep = "\\.", into = c("Abund", "Taxa"))
+reslfc.df$log2FoldChange <- reslfc.df$log2FoldChange * (-1)
+  
+
+ggplot(reslfc.df) +
+  geom_bar(aes(x = Taxa, y = log2FoldChange), fill = "#00008b", stat = "identity") +
+  ylim(c(-max(abs(reslfc.df$log2FoldChange)), max(abs(reslfc.df$log2FoldChange)))) +
+  coord_flip() +
+  theme_classic()
+
+ggsave("deseq_spec_kraken.jpg", height = 3, width = 12.75, units = "cm", dpi = "retina")
+```
+
